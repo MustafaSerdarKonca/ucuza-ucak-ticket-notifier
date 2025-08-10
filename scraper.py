@@ -157,47 +157,78 @@ def format_message(item, dates, cfg):
 # =========================
 def collect_cards(page):
     """
-    Ana sayfada Elementor kolonları içindeki uçuş kartlarını topla.
-    Mantık:
-      - /ucak-bileti/ içeren linkleri al
-      - Her benzersiz href için en yakın elementor-column atasının tüm metnini oku
-      - Metinden rota (origin, destination) ve fiyatı çıkar
+    Ana sayfada gerçek ilan kartlarını topla.
+    Yöntem:
+      - /ucak-bileti/ altındaki detay linklerini bul
+      - header/nav/footer/menu içindeki linkleri dışla
+      - aynı href'e sahip tüm linklerin metinlerinden rota ve fiyatı çıkar
     """
     items = []
-    seen = set()
+    seen_hrefs = set()
 
-    # Sayfada linkler gerçekten görününceye kadar bekle
+    # Linkler DOM'a gelsin
     try:
         page.wait_for_selector('a[href*="/ucak-bileti/"]', timeout=15000)
     except Exception:
         pass
 
     links = page.locator('a[href*="/ucak-bileti/"]').all()
+
     for a in links:
         href = a.get_attribute("href") or ""
-        if not href or href in seen:
+        if not href:
             continue
-        seen.add(href)
+        href = urljoin(BASE_URL, href)
 
-        # En yakın Elementor kolon sarmalayıcısı
+        # Kategori/menü kökünü ele (…/ucak-bileti/ tek başına ise)
+        if re.search(r"/ucak-bileti/?$", href):
+            continue
+
+        # Menü/başlık/altbilgi alanlarındaki linkleri ele
         try:
-            col = a.locator("xpath=ancestor::div[contains(@class,'elementor-column')][1]")
-            block_text = col.inner_text()
+            is_nav = page.evaluate(
+                'el => !!el.closest("header, nav, footer, .site-footer, .elementor-nav-menu, .menu, .widget, aside")',
+                a
+            )
+            if is_nav:
+                continue
         except Exception:
-            block_text = a.inner_text()
+            pass
 
-        text = clean(block_text)
+        if href in seen_hrefs:
+            continue
+        seen_hrefs.add(href)
 
-        # Rota (ok veya tire ile ayrılmış)
-        # Ör: "İstanbul - Tokyo" / "İstanbul → Tokyo"
-        origin, destination = extract_route(text)
+        # Aynı href'e sahip tüm linklerin metinlerini topla
+        group = page.locator(f'a[href="{href}"]').all()
+        texts = []
+        for g in group:
+            try:
+                t = clean(g.inner_text())
+                if t:
+                    texts.append(t)
+            except Exception:
+                pass
 
-        # Fiyat
-        m = PRICE_RE.search(text)
-        price_text = clean(m.group(0)) if m else ""
-        price_int = parse_price_to_int(price_text)
+        # Rota adayını bul (ok veya tire içeren)
+        route_text = ""
+        for t in texts:
+            if ("→" in t) or (" - " in t) or ARROW_RE.search(t):
+                route_text = t
+                break
+        origin, destination = extract_route(route_text)
 
-        # Çok zayıf adayları ele (hem rota hem fiyat yoksa)
+        # Fiyatı bul
+        price_text = ""
+        price_int = 0
+        for t in texts:
+            m = PRICE_RE.search(t)
+            if m:
+                price_text = clean(m.group(0))
+                price_int = parse_price_to_int(price_text)
+                break
+
+        # Çok zayıf sinyaller (ne rota ne fiyat) ise ele
         if not origin and not destination and price_int == 0:
             continue
 
@@ -208,29 +239,68 @@ def collect_cards(page):
             "destination": destination,
             "price_text": price_text,
             "price": price_int,
-            "posted_text": "",  # istersen ayrıca "paylaşıldı" metni için regex ekleyebiliriz
+            "posted_text": "",
         })
 
     return items
 
 def collect_detail_dates(page):
-    """Detay sayfasındaki görünen tarih maddeleri."""
-    dates = []
-    for loc in DETAIL_DATE_LOCATORS:
+    """
+    Detay sayfasında 'içerik alanı' içindeki liste maddelerinden
+    tarih/ay içerenleri topla. Menü/yan kolon maddeleri ayıklanır.
+    """
+    TR_MONTHS = r"Ocak|Şubat|Mart|Nisan|Mayıs|Haziran|Temmuz|Ağustos|Eylül|Ekim|Kasım|Aralık"
+    DATE_RE = re.compile(
+        rf"\b(\d{{1,2}}\s*(?:{TR_MONTHS})\s*\d{{4}}|\b(?:{TR_MONTHS})\b|\d{{1,2}}[./-]\d{{1,2}}[./-]\d{{2,4}})",
+        re.IGNORECASE
+    )
+
+    roots = [
+        "article .entry-content",
+        "main .entry-content",
+        "article",
+        "div.elementor-widget-container",
+    ]
+
+    picked = []
+    for root in roots:
         try:
-            for li in page.locator(loc).all():
-                t = clean(li.inner_text())
-                if t and len(t) < 120:
-                    dates.append(t)
+            lis = page.locator(f"{root} ul li").all()
+            for li in lis:
+                try:
+                    t = clean(li.inner_text())
+                except Exception:
+                    t = ""
+                if not t:
+                    continue
+                # Menü/etiket benzeri gereksiz kısa maddeleri ele
+                if len(t) < 3:
+                    continue
+                # Tarih/ay içermeyenleri ele
+                if not DATE_RE.search(t):
+                    continue
+                picked.append(t)
         except Exception:
             pass
-    # Benzersiz sırayı koru
-    uniq = []
-    for d in dates:
-        if d not in uniq:
-            uniq.append(d)
-    return uniq[:50]
 
+    # Hiç bulamazsak: son çare tüm <li> içinde tarih/ay filtreli ara
+    if not picked:
+        for li in page.locator("ul li").all():
+            try:
+                t = clean(li.inner_text())
+            except Exception:
+                t = ""
+            if t and DATE_RE.search(t) and len(t) < 120:
+                picked.append(t)
+
+    # Benzersiz sırayı koru
+    seen = set()
+    out = []
+    for t in picked:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out[:50]
 
 def run_scrape():
     cfg = load_config()
