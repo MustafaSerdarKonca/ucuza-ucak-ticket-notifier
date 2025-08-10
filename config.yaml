@@ -1,0 +1,11 @@
+# Filtreler (boş bırakırsanız hepsi geçer)
+filters:
+  departure: "istanbul"        # kalkış metninde "istanbul" içersin (büyük-küçük harf duyarsız). Boşsa filtre yok.
+  arrivals: ["londra", "paris", "amsterdam"]  # varış metninde bu kelimelerden en az biri geçsin. Boş dizi = filtre yok.
+  max_price: 0                 # 0 veya boş = sınırsız; örn: 3500 -> en fazla 3500 TL
+
+# Bildirim mesaj şablonu
+message_template: |
+  ✈️ {origin} → {destination} — {price} TL
+  Tarihler: {dates}
+  Kaynak: {url}
