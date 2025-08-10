@@ -15,6 +15,7 @@ import re
 import json
 import time
 import yaml
+import unicodedata
 import random
 import logging
 from datetime import datetime, timezone
@@ -104,22 +105,38 @@ def extract_route(text: str):
 def make_id_from_url(url: str):
     return url  # URL benzersiz kabul
 
+def normalize_tr(s: str) -> str:
+    """
+    Türkçe karakter ve i/ı/İ normalizasyonu + aksan kaldırma + lower.
+    'İstanbul', 'ISTANBUL', 'ıstanbul' -> 'istanbul'
+    """
+    if not s:
+        return ""
+    s = s.replace("İ", "i").replace("I", "i").replace("ı", "i")
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s.lower().strip()
+
 def apply_filters(listings, cfg):
     filt = (cfg.get("filters") or {})
-    dep = clean((filt.get("departure") or "")).lower()
-    arrivals = [clean(a).lower() for a in (filt.get("arrivals") or [])]
+    dep = normalize_tr(filt.get("departure") or "")
+    arrivals = [normalize_tr(a) for a in (filt.get("arrivals") or [])]
     max_price = int(filt.get("max_price") or 0)
 
     out = []
     for it in listings:
-        if dep and dep not in it["origin"].lower():
+        origin_n = normalize_tr(it.get("origin", ""))
+        dest_n   = normalize_tr(it.get("destination", ""))
+
+        if dep and dep not in origin_n:
             continue
-        if arrivals and all(a not in it["destination"].lower() for a in arrivals):
+        if arrivals and all(a not in dest_n for a in arrivals):
             continue
-        if max_price and it.get("price", 0) > max_price:
+        if max_price and (it.get("price") or 0) > max_price:
             continue
         out.append(it)
     return out
+
 
 def format_message(item, dates, cfg):
     tmpl = cfg.get("message_template") or (
@@ -247,6 +264,10 @@ def run_scrape():
             pass
 
         listings = collect_cards(page)
+        # Örnek ilk 5 kartı logla (rota, fiyat, url)
+        for i, it in enumerate(listings[:5], 1):
+            logging.info(f"[Örnek {i}] {it.get('origin')} -> {it.get('destination')} | {it.get('price_text')} | {it.get('url')}")
+
         logging.info(f"Ana sayfada bulunan kart sayısı: {len(listings)}")
 
         filtered = apply_filters(listings, cfg)
