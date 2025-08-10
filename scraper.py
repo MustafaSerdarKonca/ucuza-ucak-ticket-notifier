@@ -91,6 +91,28 @@ def load_config(path=CONFIG_PATH):
 def clean(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
+def expand_content(page):
+    """
+    Detay sayfada gizli kalan liste/tarih blokları için yaygın butonlara tıklar.
+    """
+    candidates = [
+        'text="Devamını Oku"',
+        'text="Devamını oku"',
+        'text="Daha Fazla"',
+        'text="Daha fazla"',
+        'text="Tarih"',
+        'text="Tarihler"',
+        'role=button[name*="Tarih"i]',
+        'role=button[name*="Devam"i]',
+    ]
+    for sel in candidates:
+        try:
+            if page.locator(sel).first.is_visible():
+                page.locator(sel).first.click()
+                page.wait_for_timeout(600)
+        except Exception:
+            pass
+
 def parse_price_to_int(s: str) -> int:
     # "3.299 TL" -> 3299; "12 450₺" -> 12450
     digits = re.sub(r"[^\d]", "", s or "")
@@ -377,41 +399,67 @@ def collect_cards(page):
 
 def collect_detail_dates(page):
     """
-    Detay sayfasında içerik alanındaki <ul><li> metinlerini topla,
-    tarih aralıklarını ayrıştır ve biçimlendir.
+    Detay sayfasında 'Tarih/Tarihler/Uygun Tarihler' başlıklarının hemen altındaki
+    <ul><li> maddelerinden tarih aralıklarını al ve biçimlendir.
+    Bulamazsak son çare tüm <li> içinde ararız.
     """
-    roots = [
-        "article .entry-content",
-        "main .entry-content",
-        "article",
-        "div.elementor-widget-container",
-    ]
+    # Önce varsa gizli blokları aç
+    expand_content(page)
+
+    # 1) Başlık odaklı: 'Tarih' içeren heading'i bul, sonraki kardeşlerde ul>li ara
+    headings = page.locator("h1, h2, h3, h4, h5, h6")
     raw_items = []
-    for root in roots:
+
+    for i in range(headings.count()):
         try:
-            for li in page.locator(f"{root} ul li").all():
-                try:
-                    t = clean(li.inner_text())
-                    if t:
-                        raw_items.append(t)
-                except Exception:
-                    pass
+            h = headings.nth(i)
+            txt = clean(h.inner_text())
+            if not txt:
+                continue
+            if any(k in txt.lower() for k in ["tarih", "tarihler", "uygun tarih"]):
+                # Heading'in ebeveyni içinde (veya sonrasında) ilk ul>li bloklarını topla
+                parent = h.locator("xpath=ancestor::*[self::div or self::section or self::article][1]")
+                buckets = [
+                    parent.locator("ul li"),
+                    h.locator("xpath=following::ul[1]/li"),
+                    parent.locator(".elementor-widget-container ul li"),
+                ]
+                for bucket in buckets:
+                    for li in bucket.all():
+                        try:
+                            t = clean(li.inner_text())
+                            if t:
+                                raw_items.append(t)
+                        except Exception:
+                            pass
         except Exception:
             pass
 
+    # 2) Başlık temelli bulamadıysak içerik alanındaki ul>li'ları topla
     if not raw_items:
-        # Son çare: tüm li'lar
-        for li in page.locator("ul li").all():
+        roots = [
+            "article .entry-content",
+            "main .entry-content",
+            "article",
+            "div.elementor-widget-container",
+            ".elementor-section .elementor-container",
+        ]
+        for root in roots:
             try:
-                t = clean(li.inner_text())
-                if t:
-                    raw_items.append(t)
+                for li in page.locator(f"{root} ul li").all():
+                    try:
+                        t = clean(li.inner_text())
+                        if t:
+                            raw_items.append(t)
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
-    # Biçimlendirilmiş tarih satırlarını üret
+    # 3) Metinlerden tarih aralığı satırlarını üret
     formatted = format_dates_lines_from_list(raw_items)
     return formatted[:50]
+
 
 def run_scrape():
     cfg = load_config()
@@ -464,6 +512,7 @@ def run_scrape():
                 logging.info(f"Detay sayfasına gidiliyor: {item['url']}")
                 page.goto(item["url"], timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
                 page.wait_for_timeout(WAIT_DOM_MS)
+                expand_content(page)
                 # Bazı sayfalar “devamını oku” tarzı gizleme kullanabilir
                 dates = collect_detail_dates(page)
             except PwTimeout:
