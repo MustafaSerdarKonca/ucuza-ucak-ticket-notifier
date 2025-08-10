@@ -1,3 +1,4 @@
 playwright
 PyYAML
 requests
+python-dateutil
