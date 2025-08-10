@@ -2,88 +2,68 @@
 # -*- coding: utf-8 -*-
 
 """
-UcuzUcak.net scraper
-- Ana sayfadaki rota kartlarını çeker (kalkış, varış, fiyat, paylaşım zamanı, ilan URL)
-- İlan detay sayfasından görünen "uygun tarih aralıkları" listesini toplar
-- state.json ile karşılaştırıp sadece yeni ilanları Telegram'a yollar
-- İsteklerde rastgele 1–3 sn gecikme, 3 denemeli artan bekleme, basit loglama
-- Filtreler ve mesaj şablonu config.yaml'dan okunur
-- CSS selektörleri en üstte değişkenlerde toplandı (site yapısı değişirse hızlı değiştirin)
-
-Tamamen ücretsiz:
-- Python (requests + bs4)
-- GitHub Actions (cron */10 * * * *) ile zamanlayıcı
+ucuzaucak.net DOM scraping (Playwright)
+- Ana sayfa: ilan kartlarını DOM yüklendikten sonra bulur
+- Detay sayfası: görünen tarih maddelerini toplar
+- state.json ile idempotent
+- config.yaml ile filtreleme + mesaj şablonu
+- Telegram’a gönderim: telegram.py
 """
 
 import os
 import re
 import json
 import time
+import yaml
 import random
 import logging
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 
-import requests
-from bs4 import BeautifulSoup
-import yaml
-
-from telegram import send_message  # telegram.py içinden
+from telegram import send_message  # telegram.py
+from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
 
 # =========================
-#  SITE & SELECTOR AYARLARI
+#  AYARLAR
 # =========================
 BASE_URL = "https://ucuzaucak.net/"
 
-# Ana sayfa – ilan kartı selektörleri
-# Not: Site yapısı değişirse sadece bu kısımda güncelleme yapmanız genelde yeterli olur.
-CARD_SELECTOR = "a.relative.flex.flex-col"  # İlan kartı link kapsayıcısı (örnek Tailwind sınıfları)
-ROUTE_TEXT_SELECTOR = ".flex.items-center.gap-1.text-sm"  # "İstanbul → Paris" vb.
-PRICE_SELECTOR = ".text-lg.font-semibold"  # "3.299 TL" vb.
-TIME_SELECTOR = "time, .text-xs.text-gray-500"  # Paylaşım/güncelleme zamanı gibi görünen alan
-URL_ATTR = "href"  # Kart linki
+# ---- CSS/XPath/Heuristik Seçiciler ----
+# Site yapısı değişirse burada oynayacağız.
+# 1) Kart kapsayıcı adayları (esnek tutuyoruz)
+CARD_LOCATORS = [
+    "a:has-text('→')",             # içinde yön oku olan linkler
+    "article a",                   # WP tema: yazı linki
+    "a.entry-title",               # başlık linki
+    "a.relative",                  # önceki tahmin
+]
 
-# Detay sayfası – uygun tarih listesi selektörü
-DETAIL_DATES_LIST_SELECTOR = "ul li"  # Detayda listelenen tarih maddeleri (gerekirse özelleştirin)
+# 2) Kart içinden route, price, time çekmeye yardımcı regexler
+PRICE_RE = re.compile(r"(\d[\d\.\s]{1,12})\s?(?:TL|₺)", re.IGNORECASE)
+ARROW_RE = re.compile(r"(.+?)\s*(?:→|->|›|▶|–|-)\s*(.+)", re.UNICODE)
 
-# =========================
-#  İSTEK & UA AYARLARI
-# =========================
-DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/123.0 Safari/537.36"
-    ),
-    "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": "https://www.google.com/",
-    "Cache-Control": "no-cache",
-}
+# 3) Detay sayfasındaki tarih listesi için seçiciler
+DETAIL_DATE_LOCATORS = [
+    "ul li",          # klasik liste
+    "div:has-text('Tarih') >> .. li",
+    "div:has-text('Uygun') >> .. li",
+]
 
-SESSION = requests.Session()
-SESSION.headers.update(DEFAULT_HEADERS)
+# Playwright zaman aşımı (ms)
+NAV_TIMEOUT = 25_000
+WAIT_DOM_MS = 6_000
 
-# =========================
-#  DOSYA YOLLARI
-# =========================
+# Dosya yolları
 STATE_PATH = os.path.join("data", "state.json")
 CONFIG_PATH = "config.yaml"
 
-# =========================
-#  LOG AYARLARI
-# =========================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+# Log
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
 
 # =========================
 #  YARDIMCI FONKSİYONLAR
 # =========================
-def load_config(path=CONFIG_PATH):
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
 def ensure_dirs():
     os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
 
@@ -102,109 +82,33 @@ def save_state(state: dict):
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
 
-def http_get(url: str, max_retries=3, base_sleep=1.5, timeout=20):
-    """Basit retry + artan bekleme ile GET isteği."""
-    last_exc = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = SESSION.get(url, timeout=timeout)
-            if resp.status_code == 200:
-                return resp
-            logging.warning(f"GET {url} status={resp.status_code}")
-        except requests.RequestException as e:
-            last_exc = e
-            logging.warning(f"GET hata (deneme {attempt}/{max_retries}): {e}")
-        # artan bekleme
-        sleep_s = base_sleep * attempt + random.uniform(0, 0.5)
-        time.sleep(sleep_s)
-    if last_exc:
-        raise last_exc
-    raise RuntimeError(f"{url} için GET başarısız")
+def load_config(path=CONFIG_PATH):
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
-def clean_text(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip()
+def clean(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
 
 def parse_price_to_int(s: str) -> int:
-    # "3.299 TL" -> 3299 ; "12.450₺" -> 12450
-    digits = re.sub(r"[^\d]", "", s)
+    # "3.299 TL" -> 3299; "12 450₺" -> 12450
+    digits = re.sub(r"[^\d]", "", s or "")
     return int(digits) if digits else 0
 
-def extract_route(route_text: str):
-    """
-    "İstanbul (IST) → Paris (CDG)" gibi bir metinden kalkış/varış çıkarma.
-    Site metnine göre bu regex'i sade tuttuk; gerekirse özelleştirin.
-    """
-    text = route_text.replace("–", "→")
-    parts = [p.strip() for p in text.split("→")]
-    if len(parts) >= 2:
-        return parts[0], parts[1]
-    return text, ""  # ayrışmazsa tümünü kalkışa yaz
+def extract_route(text: str):
+    """Metinden kalkış/varış ayıkla; oku (→, -, ›) baz alıyoruz."""
+    m = ARROW_RE.search(text or "")
+    if not m:
+        return clean(text), ""
+    return clean(m.group(1)), clean(m.group(2))
 
 def make_id_from_url(url: str):
-    # URL benzersiz kabul edilir (idempotency için)
-    return url
+    return url  # URL benzersiz kabul
 
-def fetch_detail_dates(detail_url: str) -> list:
-    """Detay sayfasındaki görünen tarih maddelerini toplayın (örn. ul>li)."""
-    resp = http_get(detail_url)
-    soup = BeautifulSoup(resp.text, "lxml")
-    items = [clean_text(li.get_text(" ")) for li in soup.select(DETAIL_DATES_LIST_SELECTOR)]
-    # Yalnızca tarih gibi görünenleri tutmak isterseniz basit bir filtre uygulayabilirsiniz:
-    # items = [it for it in items if re.search(r"\d{1,2}\s+[A-Za-zÇĞİÖŞÜçğıöşü]+\s+\d{4}", it)]
-    return items[:50]  # güvenlik için çok uzunsa kes
-
-def parse_homepage_listings(base_url: str) -> list:
-    """Ana sayfadaki ilan kartlarını ayrıştırır."""
-    resp = http_get(base_url)
-    soup = BeautifulSoup(resp.text, "lxml")
-
-    listings = []
-    for a in soup.select(CARD_SELECTOR):
-        try:
-            url_rel = a.get(URL_ATTR) or ""
-            url = urljoin(base_url, url_rel)
-
-            # Rota metni
-            route_el = a.select_one(ROUTE_TEXT_SELECTOR)
-            route_text = clean_text(route_el.get_text(" ")) if route_el else ""
-            origin, destination = extract_route(route_text)
-
-            # Fiyat
-            price_el = a.select_one(PRICE_SELECTOR)
-            price_text = clean_text(price_el.get_text(" ")) if price_el else ""
-            price = parse_price_to_int(price_text)
-
-            # Paylaşım zamanı / metni
-            time_el = a.select_one(TIME_SELECTOR)
-            posted_text = clean_text(time_el.get_text(" ")) if time_el else ""
-
-            # Basit doğrulama
-            if not url or (not origin and not destination and price == 0):
-                continue
-
-            listings.append({
-                "id": make_id_from_url(url),
-                "url": url,
-                "origin": origin,
-                "destination": destination,
-                "price_text": price_text,
-                "price": price,
-                "posted_text": posted_text,
-            })
-        except Exception as e:
-            logging.warning(f"Kart ayrıştırma hatası: {e}")
-        # İstek benzetimi/engellenme riskini azaltmak için minik gecikme:
-        time.sleep(random.uniform(0.2, 0.5))
-
-    return listings
-
-def apply_filters(listings: list, cfg: dict) -> list:
-    """config.yaml filtreleri uygula."""
-    filt = cfg.get("filters", {}) or {}
-
-    dep = (filt.get("departure") or "").strip().lower()
-    arrivals = [a.strip().lower() for a in (filt.get("arrivals") or [])]
-    max_price = int(filt.get("max_price") or 0)  # 0 = sınırsız
+def apply_filters(listings, cfg):
+    filt = (cfg.get("filters") or {})
+    dep = clean((filt.get("departure") or "")).lower()
+    arrivals = [clean(a).lower() for a in (filt.get("arrivals") or [])]
+    max_price = int(filt.get("max_price") or 0)
 
     out = []
     for it in listings:
@@ -212,22 +116,17 @@ def apply_filters(listings: list, cfg: dict) -> list:
             continue
         if arrivals and all(a not in it["destination"].lower() for a in arrivals):
             continue
-        if max_price and it["price"] and it["price"] > max_price:
+        if max_price and it.get("price", 0) > max_price:
             continue
         out.append(it)
     return out
 
-def format_message(item: dict, dates: list, cfg: dict) -> str:
+def format_message(item, dates, cfg):
     tmpl = cfg.get("message_template") or (
-        "✈️ {origin} → {destination} — {price} TL\n"
-        "Tarihler: {dates}\n"
-        "Kaynak: {url}"
+        "✈️ {origin} → {destination} — {price} TL\nTarihler: {dates}\nKaynak: {url}"
     )
     date_str = ", ".join(dates) if dates else "—"
-    price_num = item.get("price") or 0
-    # Eğer metin olarak fiyat daha uygunsa:
-    price_disp = item.get("price_text") or str(price_num)
-
+    price_disp = item.get("price_text") or str(item.get("price", "—"))
     return tmpl.format(
         origin=item.get("origin", ""),
         destination=item.get("destination", ""),
@@ -236,53 +135,147 @@ def format_message(item: dict, dates: list, cfg: dict) -> str:
         url=item.get("url", ""),
     )
 
-def main():
+# =========================
+#  PLAYWRIGHT SCRAPERS
+# =========================
+def collect_cards(page):
+    """Ana sayfada görünen kart linklerini ve metinlerini topla (heuristik)."""
+    seen_urls = set()
+    items = []
+
+    # Heuristik: birden fazla locator ile dene, birleşik unique liste yap
+    for loc in CARD_LOCATORS:
+        for a in page.locator(loc).all():
+            try:
+                href = a.get_attribute("href") or ""
+                if not href or href.startswith("#"):
+                    continue
+                url = urljoin(BASE_URL, href)
+                if url in seen_urls:
+                    continue
+
+                full_text = clean(a.inner_text())
+                # Route tespiti (oku içeren metin arıyoruz)
+                origin, dest = extract_route(full_text)
+
+                # Fiyat tespiti
+                price_text = ""
+                m = PRICE_RE.search(full_text)
+                if m:
+                    price_text = clean(m.group(0))
+                price_int = parse_price_to_int(price_text)
+
+                # Zayıf sinyallerde (ne route ne fiyat) ele
+                if not origin and not dest and price_int == 0:
+                    continue
+
+                seen_urls.add(url)
+                items.append({
+                    "id": make_id_from_url(url),
+                    "url": url,
+                    "origin": origin,
+                    "destination": dest,
+                    "price_text": price_text,
+                    "price": price_int,
+                    "posted_text": "",  # İstenirse ayrı locator'la genişletilir
+                })
+            except Exception:
+                continue
+    return items
+
+def collect_detail_dates(page):
+    """Detay sayfasındaki görünen tarih maddeleri."""
+    dates = []
+    for loc in DETAIL_DATE_LOCATORS:
+        try:
+            for li in page.locator(loc).all():
+                t = clean(li.inner_text())
+                if t and len(t) < 120:
+                    dates.append(t)
+        except Exception:
+            pass
+    # Benzersiz sırayı koru
+    uniq = []
+    for d in dates:
+        if d not in uniq:
+            uniq.append(d)
+    return uniq[:50]
+
+
+def run_scrape():
     cfg = load_config()
     state = load_state()
     seen = state.get("seen_ids", {})
 
-    logging.info("Ana sayfa taranıyor...")
-    all_listings = parse_homepage_listings(BASE_URL)
-    logging.info(f"{len(all_listings)} ilan aday bulundu.")
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0 Safari/537.36"
+            ),
+            locale="tr-TR",
+        )
+        page = context.new_page()
 
-    filtered = apply_filters(all_listings, cfg)
-    logging.info(f"Filtre sonrası {len(filtered)} ilan kaldı.")
+        logging.info("Ana sayfa açılıyor...")
+        page.goto(BASE_URL, timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
+        # Biraz bekle ki JS listeyi doldursun
+        page.wait_for_timeout(WAIT_DOM_MS)
 
-    new_items = [it for it in filtered if it["id"] not in seen]
-    logging.info(f"Yeni ilan sayısı: {len(new_items)}")
-
-    for idx, item in enumerate(new_items, 1):
-        # Detay sayfasındaki tarihleri çek
+        # Bazı siteler scroll sonrası yükler
         try:
-            # 1–3 sn rastgele gecikme (daha doğal trafik için)
-            time.sleep(random.uniform(1.0, 3.0))
-            dates = fetch_detail_dates(item["url"])
-        except Exception as e:
-            logging.warning(f"Detay tarihleri alınamadı ({item['url']}): {e}")
-            dates = []
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(1500)
+        except Exception:
+            pass
 
-        # Mesajı formatla ve Telegram'a gönder
-        try:
+        listings = collect_cards(page)
+        logging.info(f"Ana sayfada bulunan kart sayısı: {len(listings)}")
+
+        filtered = apply_filters(listings, cfg)
+        logging.info(f"Filtre sonrası {len(filtered)} ilan kaldı.")
+
+        new_items = [it for it in filtered if it["id"] not in seen]
+        logging.info(f"Yeni ilan sayısı: {len(new_items)}")
+
+        for idx, item in enumerate(new_items, 1):
+            try:
+                # Nazik olun: 1–3 sn bekle
+                time.sleep(random.uniform(1.0, 3.0))
+                logging.info(f"Detay sayfasına gidiliyor: {item['url']}")
+                page.goto(item["url"], timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
+                page.wait_for_timeout(WAIT_DOM_MS)
+                # Bazı sayfalar “devamını oku” tarzı gizleme kullanabilir
+                dates = collect_detail_dates(page)
+            except PwTimeout:
+                logging.warning("Detay sayfası zaman aşımı.")
+                dates = []
+            except Exception as e:
+                logging.warning(f"Detay sayfası hata: {e}")
+                dates = []
+
             msg = format_message(item, dates, cfg)
             ok, err = send_message(msg)
             if ok:
-                logging.info(f"[{idx}/{len(new_items)}] Telegram'a gönderildi: {item['url']}")
-                # idempotency için görüldü olarak işaretle
+                logging.info(f"[{idx}/{len(new_items)}] Telegram'a gönderildi.")
                 seen[item["id"]] = {
                     "first_seen": datetime.now(timezone.utc).isoformat(),
                     "url": item["url"],
                     "price": item.get("price", 0),
                 }
-                # Her gönderi sonrası state'i yaz (aksama olursa kaybolmasın)
                 state["seen_ids"] = seen
                 save_state(state)
             else:
                 logging.error(f"Telegram gönderim hatası: {err}")
-        except Exception as e:
-            logging.error(f"Mesaj gönderim hatası: {e}")
+
+        context.close()
+        browser.close()
 
     if not new_items:
-        logging.info("Yeni ilan yok. İşlem tamam.")
+        logging.info("Yeni ilan yok veya selektörler eşleşmedi. İşlem tamam.")
+
 
 if __name__ == "__main__":
-    main()
+    run_scrape()
