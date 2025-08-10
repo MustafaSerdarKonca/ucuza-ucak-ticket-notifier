@@ -139,48 +139,61 @@ def format_message(item, dates, cfg):
 #  PLAYWRIGHT SCRAPERS
 # =========================
 def collect_cards(page):
-    """Ana sayfada görünen kart linklerini ve metinlerini topla (heuristik)."""
-    seen_urls = set()
+    """
+    Ana sayfada Elementor kolonları içindeki uçuş kartlarını topla.
+    Mantık:
+      - /ucak-bileti/ içeren linkleri al
+      - Her benzersiz href için en yakın elementor-column atasının tüm metnini oku
+      - Metinden rota (origin, destination) ve fiyatı çıkar
+    """
     items = []
+    seen = set()
 
-    # Heuristik: birden fazla locator ile dene, birleşik unique liste yap
-    for loc in CARD_LOCATORS:
-        for a in page.locator(loc).all():
-            try:
-                href = a.get_attribute("href") or ""
-                if not href or href.startswith("#"):
-                    continue
-                url = urljoin(BASE_URL, href)
-                if url in seen_urls:
-                    continue
+    # Sayfada linkler gerçekten görününceye kadar bekle
+    try:
+        page.wait_for_selector('a[href*="/ucak-bileti/"]', timeout=15000)
+    except Exception:
+        pass
 
-                full_text = clean(a.inner_text())
-                # Route tespiti (oku içeren metin arıyoruz)
-                origin, dest = extract_route(full_text)
+    links = page.locator('a[href*="/ucak-bileti/"]').all()
+    for a in links:
+        href = a.get_attribute("href") or ""
+        if not href or href in seen:
+            continue
+        seen.add(href)
 
-                # Fiyat tespiti
-                price_text = ""
-                m = PRICE_RE.search(full_text)
-                if m:
-                    price_text = clean(m.group(0))
-                price_int = parse_price_to_int(price_text)
+        # En yakın Elementor kolon sarmalayıcısı
+        try:
+            col = a.locator("xpath=ancestor::div[contains(@class,'elementor-column')][1]")
+            block_text = col.inner_text()
+        except Exception:
+            block_text = a.inner_text()
 
-                # Zayıf sinyallerde (ne route ne fiyat) ele
-                if not origin and not dest and price_int == 0:
-                    continue
+        text = clean(block_text)
 
-                seen_urls.add(url)
-                items.append({
-                    "id": make_id_from_url(url),
-                    "url": url,
-                    "origin": origin,
-                    "destination": dest,
-                    "price_text": price_text,
-                    "price": price_int,
-                    "posted_text": "",  # İstenirse ayrı locator'la genişletilir
-                })
-            except Exception:
-                continue
+        # Rota (ok veya tire ile ayrılmış)
+        # Ör: "İstanbul - Tokyo" / "İstanbul → Tokyo"
+        origin, destination = extract_route(text)
+
+        # Fiyat
+        m = PRICE_RE.search(text)
+        price_text = clean(m.group(0)) if m else ""
+        price_int = parse_price_to_int(price_text)
+
+        # Çok zayıf adayları ele (hem rota hem fiyat yoksa)
+        if not origin and not destination and price_int == 0:
+            continue
+
+        items.append({
+            "id": make_id_from_url(href),
+            "url": href,
+            "origin": origin,
+            "destination": destination,
+            "price_text": price_text,
+            "price": price_int,
+            "posted_text": "",  # istersen ayrıca "paylaşıldı" metni için regex ekleyebiliriz
+        })
+
     return items
 
 def collect_detail_dates(page):
@@ -221,6 +234,8 @@ def run_scrape():
 
         logging.info("Ana sayfa açılıyor...")
         page.goto(BASE_URL, timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
+        page.wait_for_selector('a[href*="/ucak-bileti/"]', timeout=15000)
+        page.wait_for_timeout(1000)  # minik tampon
         # Biraz bekle ki JS listeyi doldursun
         page.wait_for_timeout(WAIT_DOM_MS)
 
