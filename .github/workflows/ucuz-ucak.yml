@@ -1,14 +1,9 @@
-
----
-
-## `.github/workflows/ucuz-ucak.yml`
-
 name: Ucuz Uçak Tarayıcı
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # her 10 dakikada bir
-  workflow_dispatch: {}      # manuel tetik
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
 
 jobs:
   run-scraper:
@@ -16,16 +11,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      # (Opsiyonel) Bir önceki başarılı çalışmadan state.json'ı indir
-      # Bu action, aynı workflow'un en son başarılı artifact'ını indirebiliyor
-      - name: Download previous state artifact (optional)
-        uses: dawidd6/action-download-artifact@v6
-        with:
-          workflow: ucuz-ucak.yml
-          name: ucuz-ucak-state
-          path: data
-        continue-on-error: true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -36,20 +21,28 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
 
-      - name: Run scraper
+      # (Opsiyonel) Önceki state'i indir
+      - name: Download previous state artifact (optional)
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: ucuz-ucak.yml
+          name: ucuz-ucak-state
+          path: data
+        continue-on-error: true
+
+      - name: Run scraper (Playwright)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           mkdir -p data
-          # State yoksa boş oluştur (idempotent)
           if [ ! -f data/state.json ]; then
             echo '{"seen_ids":{}}' > data/state.json
           fi
           python scraper.py
 
-      # (Opsiyonel) Güncel state.json'ı artifact olarak yükle
       - name: Upload state artifact (optional)
         uses: actions/upload-artifact@v4
         with:
