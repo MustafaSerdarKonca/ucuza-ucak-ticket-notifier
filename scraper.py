@@ -91,6 +91,66 @@ def load_config(path=CONFIG_PATH):
 def clean(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
+# ------------------------------
+# URL'den rota çıkarımı (şehirleri slaktan ayıklama)
+# ------------------------------
+STOPWORDS = {
+    "ucuza", "ucak", "uçak", "bileti", "bilet", "kampanya", "kampanyasi",
+    "kampanyası", "fiyati", "fiyatı", "ve", "ile", "gidis", "gidiş",
+    "donus", "dönüş", "tek", "yon", "yön", "seyahat", "ucuz", "en",
+    "biletleri", "gezi", "rehberi"
+}
+
+def prettify_city(token: str) -> str:
+    t = (token or "").strip("-_/ ")
+    if not t:
+        return ""
+    # Basit baş harf büyütme; Türkçe özel durumları istersen burada genişletebilirsin
+    return t.capitalize()
+
+def infer_route_from_url(url: str):
+    """
+    Ör: https://ucuzaucak.net/ucak-bileti/istanbul-tokyo-ucuza-ucak-bileti-2/
+        → ("İstanbul", "Tokyo")
+    Mantık:
+      - /ucak-bileti/<slug>/ parçasını al
+      - slug'ı '-' ile böl
+      - yaygın SEO kelimelerini (STOPWORDS) ele
+      - kalan ilk 2 kelimeyi kalkış/varış kabul et
+      - 'buenos aires' gibi çok kelimeli şehirler için basit birleştirme desteği
+    """
+    try:
+        m = re.search(r"/ucak-bileti/([^/]+)/?", url)
+        if not m:
+            return "", ""
+        slug = m.group(1)  # istanbul-tokyo-ucuza-ucak-bileti-2
+        parts = [p for p in slug.split("-") if p]
+        # stopwords ele
+        parts = [p for p in parts if p.lower() not in STOPWORDS]
+        if len(parts) < 2:
+            return "", ""
+
+        # İlk iki parçayı şehir varsay
+        o_parts = [parts[0]]
+        d_parts = [parts[1]]
+
+        # Çok kelimeli şehir (ör. buenos-aires) basit desteği:
+        if parts[0].lower() == "buenos" and len(parts) > 1 and parts[1].lower() == "aires":
+            o_parts = ["buenos", "aires"]
+            if len(parts) > 2:
+                d_parts = [parts[2]]
+                if len(parts) > 3 and parts[3][0].isalpha():
+                    d_parts.append(parts[3])
+        elif parts[1].lower() == "buenos" and len(parts) > 2 and parts[2].lower() == "aires":
+            d_parts = ["buenos", "aires"]
+
+        origin = " ".join(prettify_city(p) for p in o_parts)
+        destination = " ".join(prettify_city(p) for p in d_parts)
+        return origin, destination
+    except Exception:
+        return "", ""
+
+
 def expand_content(page):
     """
     Detay sayfada gizli kalan liste/tarih blokları için yaygın butonlara tıklar.
@@ -370,6 +430,13 @@ def collect_cards(page):
                 route_text = t
                 break
         origin, destination = extract_route(route_text)
+
+        # Rota metinden çıkmazsa URL'den dene
+        if not origin or not destination:
+            o2, d2 = infer_route_from_url(href)
+            origin = origin or o2
+            destination = destination or d2
+
 
         # Fiyatı bul
         price_text = ""
