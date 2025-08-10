@@ -16,6 +16,7 @@ import json
 import time
 import yaml
 import unicodedata
+from dateutil.parser import parse as dtparse
 import random
 import logging
 from datetime import datetime, timezone
@@ -117,6 +118,103 @@ def normalize_tr(s: str) -> str:
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     return s.lower().strip()
 
+# ------------------------------
+# Türkçe tarih ayrıştırma & biçimleme
+# ------------------------------
+TR_MONTHS_MAP = {
+    "ocak": 1, "şubat": 2, "subat": 2, "mart": 3, "nisan": 4, "mayıs": 5, "mayis": 5,
+    "haziran": 6, "temmuz": 7, "ağustos": 8, "agustos": 8, "eylül": 9, "eylul": 9,
+    "ekim": 10, "kasım": 11, "kasim": 11, "aralık": 12, "aralik": 12
+}
+TR_DAY_NAMES = ["Pazartesi","Salı","Çarşamba","Perşembe","Cuma","Cumartesi","Pazar"]
+
+def norm(s: str) -> str:
+    if not s: return ""
+    s = s.replace("İ","i").replace("I","i").replace("ı","i")
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s.lower().strip()
+
+def month_to_num(name: str) -> int:
+    return TR_MONTHS_MAP.get(norm(name), 0)
+
+def tr_format_date(dt: datetime) -> str:
+    # "24 Kasım Pazartesi" biçimi
+    ay_adı = list(TR_MONTHS_MAP.keys())[list(TR_MONTHS_MAP.values()).index(dt.month)]
+    # ay_adı listede "mayis" gibi de olabilir, güzel gösterelim:
+    pretty = {
+        "ocak":"Ocak","subat":"Şubat","şubat":"Şubat","mart":"Mart","nisan":"Nisan","mayis":"Mayıs","mayıs":"Mayıs",
+        "haziran":"Haziran","temmuz":"Temmuz","agustos":"Ağustos","ağustos":"Ağustos","eylul":"Eylül","eylül":"Eylül",
+        "ekim":"Ekim","kası m":"Kasım","kasim":"Kasım","kasım":"Kasım","aralik":"Aralık","aralık":"Aralık"
+    }.get(norm(ay_adı), ay_adı.capitalize())
+    gun = TR_DAY_NAMES[dt.weekday()]
+    return f"{dt.day:02d} {pretty} {gun}"
+
+def parse_tr_date(day_s: str, month_s: str, year_s: str = "") -> datetime:
+    d = int(day_s)
+    m = month_to_num(month_s)
+    if m == 0:
+        raise ValueError("Ay çözümlenemedi")
+    y = int(year_s) if year_s else datetime.utcnow().year
+    # yıl eksik ve ay geçmiş/yakın taşmalar olabilir → dtparse fallback kullan
+    try:
+        return datetime(y, m, d)
+    except Exception:
+        # dateutil ile şansımızı deneyelim
+        return dtparse(f"{d} {month_s} {y}", dayfirst=True)
+
+def parse_date_range_line(text: str):
+    """
+    '24 Kasım – 01 Aralık', '24 Kasım 2025 - 01 Aralık 2025' gibi satırları yakalar.
+    Dönüş: (start_dt, end_dt) veya None
+    """
+    import re
+    t = text.strip()
+    # iki uç tarih yakala (ay adları Türkçe)
+    # 1) 24 Kasım 2025 – 01 Aralık 2025
+    pat_full = re.compile(
+        r"(\d{1,2})\s+([A-Za-zÇĞİÖŞÜçğıöşü]+)\s*(\d{4})?\s*[–—\-]\s*(\d{1,2})\s+([A-Za-zÇĞİÖŞÜçğıöşü]+)\s*(\d{4})?",
+        re.IGNORECASE
+    )
+    m = pat_full.search(t)
+    if not m:
+        return None
+    d1, mon1, y1, d2, mon2, y2 = m.groups()
+    start = parse_tr_date(d1, mon1, y1 or "")
+    end   = parse_tr_date(d2, mon2, y2 or "")
+    # yıl/ay taşması küçük düzeltme: bitiş başlangıçtan önceyse +1 yıl dene
+    if end < start:
+        try:
+            end = end.replace(year=end.year + 1)
+        except Exception:
+            pass
+    return start, end
+
+def format_dates_lines_from_list(li_texts: list) -> list:
+    """
+    <li> metinlerini alır, tarih aralıklarını parse edip
+    '24 Kasım Pazartesi – 01 Aralık Pazartesi (7 Gün)' satırları üretir.
+    """
+    out = []
+    for raw in li_texts:
+        pr = parse_date_range_line(raw)
+        if not pr:
+            continue
+        start, end = pr
+        days = (end - start).days
+        # Gün sayısı 0 veya negatifse atla
+        if days <= 0:
+            continue
+        left = tr_format_date(start)
+        right = tr_format_date(end)
+        out.append(f"{left} – {right} ({days} Gün)")
+    # benzersiz & sıralı
+    uniq = []
+    for line in out:
+        if line not in uniq:
+            uniq.append(line)
+    return uniq
+
 def apply_filters(listings, cfg):
     filt = (cfg.get("filters") or {})
     dep = normalize_tr(filt.get("departure") or "")
@@ -138,19 +236,52 @@ def apply_filters(listings, cfg):
     return out
 
 
-def format_message(item, dates, cfg):
-    tmpl = cfg.get("message_template") or (
-        "✈️ {origin} → {destination} — {price} TL\nTarihler: {dates}\nKaynak: {url}"
-    )
-    date_str = ", ".join(dates) if dates else "—"
-    price_disp = item.get("price_text") or str(item.get("price", "—"))
-    return tmpl.format(
-        origin=item.get("origin", ""),
-        destination=item.get("destination", ""),
-        price=price_disp,
-        dates=date_str,
-        url=item.get("url", ""),
-    )
+def format_message(item, dates_lines, cfg):
+    """
+    Çıktı biçimi:
+    ✈️ İstanbul — Tokyo
+
+    💳 Fiyat: 19.920 TL
+
+    📅 Tarihler:
+    24 Kasım Pazartesi – 01 Aralık Pazartesi (7 Gün)
+    ...
+
+    🔗 Kaynak: https://...
+    """
+    # Fiyat
+    price_text = (item.get("price_text") or "").strip()
+    price_int = item.get("price", 0)
+    if price_text:
+        disp = price_text if ("TL" in price_text.upper() or "₺" in price_text) else f"{price_text} TL"
+    else:
+        disp = f"{price_int:,}".replace(",", ".") + " TL" if price_int > 0 else "—"
+
+    origin = item.get("origin") or ""
+    destination = item.get("destination") or ""
+    if not origin or not destination:
+        o2, d2 = infer_route_from_url(item.get("url", ""))
+        origin = origin or o2
+        destination = destination or d2
+
+    # Tarih satırları
+    if dates_lines:
+        dates_block = "\n".join(dates_lines)
+    else:
+        dates_block = "—"
+
+    lines = [
+        f"✈️ {origin} — {destination}",
+        "",
+        f"💳 Fiyat: {disp}",
+        "",
+        "📅 Tarihler:",
+        dates_block,
+        "",
+        f"🔗 Kaynak: {item.get('url','')}",
+    ]
+    return "\n".join(lines)
+
 
 # =========================
 #  PLAYWRIGHT SCRAPERS
@@ -246,61 +377,41 @@ def collect_cards(page):
 
 def collect_detail_dates(page):
     """
-    Detay sayfasında 'içerik alanı' içindeki liste maddelerinden
-    tarih/ay içerenleri topla. Menü/yan kolon maddeleri ayıklanır.
+    Detay sayfasında içerik alanındaki <ul><li> metinlerini topla,
+    tarih aralıklarını ayrıştır ve biçimlendir.
     """
-    TR_MONTHS = r"Ocak|Şubat|Mart|Nisan|Mayıs|Haziran|Temmuz|Ağustos|Eylül|Ekim|Kasım|Aralık"
-    DATE_RE = re.compile(
-        rf"\b(\d{{1,2}}\s*(?:{TR_MONTHS})\s*\d{{4}}|\b(?:{TR_MONTHS})\b|\d{{1,2}}[./-]\d{{1,2}}[./-]\d{{2,4}})",
-        re.IGNORECASE
-    )
-
     roots = [
         "article .entry-content",
         "main .entry-content",
         "article",
         "div.elementor-widget-container",
     ]
-
-    picked = []
+    raw_items = []
     for root in roots:
         try:
-            lis = page.locator(f"{root} ul li").all()
-            for li in lis:
+            for li in page.locator(f"{root} ul li").all():
                 try:
                     t = clean(li.inner_text())
+                    if t:
+                        raw_items.append(t)
                 except Exception:
-                    t = ""
-                if not t:
-                    continue
-                # Menü/etiket benzeri gereksiz kısa maddeleri ele
-                if len(t) < 3:
-                    continue
-                # Tarih/ay içermeyenleri ele
-                if not DATE_RE.search(t):
-                    continue
-                picked.append(t)
+                    pass
         except Exception:
             pass
 
-    # Hiç bulamazsak: son çare tüm <li> içinde tarih/ay filtreli ara
-    if not picked:
+    if not raw_items:
+        # Son çare: tüm li'lar
         for li in page.locator("ul li").all():
             try:
                 t = clean(li.inner_text())
+                if t:
+                    raw_items.append(t)
             except Exception:
-                t = ""
-            if t and DATE_RE.search(t) and len(t) < 120:
-                picked.append(t)
+                pass
 
-    # Benzersiz sırayı koru
-    seen = set()
-    out = []
-    for t in picked:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out[:50]
+    # Biçimlendirilmiş tarih satırlarını üret
+    formatted = format_dates_lines_from_list(raw_items)
+    return formatted[:50]
 
 def run_scrape():
     cfg = load_config()
