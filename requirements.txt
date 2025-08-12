@@ -1,4 +1,4 @@
-playwright
-PyYAML
-requests
-python-dateutil
+requests>=2.32.0
+beautifulsoup4>=4.12.3
+lxml>=5.2.2
+playwright>=1.46.0
